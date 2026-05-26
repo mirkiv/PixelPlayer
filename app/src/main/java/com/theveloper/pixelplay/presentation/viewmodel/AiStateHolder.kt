@@ -342,19 +342,20 @@ class AiStateHolder @Inject constructor(
 
     suspend fun translateLyrics(lyricsText: String): Result<String> {
         return try {
+            val targetLanguage = context.resources.configuration.locales[0].displayLanguage
             val prompt = """
-Translate the provided song lyrics into Russian.
+Translate the provided song lyrics into $targetLanguage.
 
 Keep every timestamp exactly unchanged.
 
-For each original line, output the original line first, then on the next line output the Russian translation with the same timestamp.
+If the lyrics are ALREADY mostly in $targetLanguage, output ONLY the exact phrase "ALREADY_IN_TARGET_LANGUAGE" without any other text.
+
+For each original line, output the original line first, then on the next line output the $targetLanguage translation with the same timestamp.
 
 Do not add any extra text, explanations, numbering, labels, or formatting.
-
 Do not remove, merge, split, or reorder lines.
 
 Output only:
-
 [timestamp] original text
 [timestamp] translated text
 

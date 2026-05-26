@@ -161,7 +161,7 @@ fun LyricsMoreBottomSheet(
                 // Translate via AI
                 if (lyrics != null) {
                     ListItem(
-                        headlineContent = { Text("Translate via AI") },
+                        headlineContent = { Text(stringResource(R.string.ai_translate_via_ai)) },
                         leadingContent = {
                             Icon(
                                 imageVector = Icons.Rounded.Translate,

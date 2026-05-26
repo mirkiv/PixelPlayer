@@ -5106,31 +5106,49 @@ class PlayerViewModel @Inject constructor(
         val currentSong = stablePlayerState.value.currentSong ?: return
         val songId = currentSong.id.toLongOrNull() ?: return
         val rawLyrics = currentSong.lyrics
+        val lyricsObj = stablePlayerState.value.lyrics
 
         if (rawLyrics.isNullOrBlank()) {
-            sendToast("No lyrics to translate")
+            sendToast(context.getString(R.string.lyrics_not_found))
             return
         }
 
+        if (lyricsObj?.synced != null) {
+            val hasValidTranslation = lyricsObj.synced.any { !it.translation.isNullOrBlank() }
+            if (hasValidTranslation) {
+                sendToast(context.getString(R.string.ai_lyrics_already_translated))
+                return
+            }
+        }
+
         viewModelScope.launch {
-            sendToast("Translating lyrics...")
+            sendToast(context.getString(R.string.ai_lyrics_translating))
             val result = aiStateHolder.translateLyrics(rawLyrics)
             result.onSuccess { translatedText ->
+                if (translatedText.trim() == "ALREADY_IN_TARGET_LANGUAGE") {
+                    sendToast(context.getString(R.string.ai_lyrics_already_in_target_language))
+                    return@onSuccess
+                }
+
                 if (translatedText.isNotBlank()) {
                     val validation = com.theveloper.pixelplay.utils.LyricsImportSecurity.validateImportedLrcContent(translatedText)
                     if (validation is com.theveloper.pixelplay.utils.LyricsImportValidationResult.Valid) {
                         lyricsStateHolder.importLyricsFromFile(songId, validation.value, currentSong)
-                        sendToast("Lyrics translated successfully!")
+                        sendToast(context.getString(R.string.ai_lyrics_translation_success))
                     } else {
                         val reason = (validation as com.theveloper.pixelplay.utils.LyricsImportValidationResult.Invalid).reason
                         val errorMsg = com.theveloper.pixelplay.utils.LyricsImportSecurity.messageFor(reason)
-                        sendToast("AI format error: $errorMsg")
+                        sendToast(context.getString(R.string.ai_error_generic, errorMsg))
                     }
                 } else {
-                     sendToast("AI returned empty response")
+                     sendToast(context.getString(R.string.ai_error_generic, "Empty response"))
                 }
             }.onFailure {
-                sendToast("Translation failed: ${it.message}")
+                if (it.message?.contains("key", ignoreCase = true) == true || it.message?.contains("config", ignoreCase = true) == true) {
+                    sendToast(context.getString(R.string.ai_error_api_key))
+                } else {
+                    sendToast(context.getString(R.string.ai_error_generic, it.message))
+                }
             }
         }
     }
