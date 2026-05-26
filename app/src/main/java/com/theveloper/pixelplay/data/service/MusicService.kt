@@ -1,6 +1,7 @@
 package com.theveloper.pixelplay.data.service
 
 import android.app.AlarmManager
+import android.app.BackgroundServiceStartNotAllowedException
 import android.app.ForegroundServiceStartNotAllowedException
 import android.app.PendingIntent
 import android.content.ComponentName
@@ -55,6 +56,7 @@ import com.theveloper.pixelplay.data.preferences.EqualizerPreferencesRepository
 import com.theveloper.pixelplay.data.preferences.ThemePreferencesRepository
 import com.theveloper.pixelplay.data.preferences.UserPreferencesRepository
 import com.theveloper.pixelplay.data.repository.MusicRepository
+import com.theveloper.pixelplay.data.service.cast.CastRemotePlaybackState
 import com.theveloper.pixelplay.data.service.player.DualPlayerEngine
 import com.theveloper.pixelplay.data.service.player.TransitionController
 import com.theveloper.pixelplay.ui.glancewidget.ControlWidget4x2
@@ -71,7 +73,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 import com.theveloper.pixelplay.data.equalizer.EqualizerManager
@@ -94,6 +95,7 @@ import com.theveloper.pixelplay.utils.ArtworkTransportSanitizer
 import com.theveloper.pixelplay.utils.MediaItemBuilder
 import com.theveloper.pixelplay.data.navidrome.NavidromeRepository
 import com.theveloper.pixelplay.di.AppScope
+import com.theveloper.pixelplay.presentation.viewmodel.ListeningStatsTracker
 import kotlin.math.abs
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
@@ -139,6 +141,8 @@ class MusicService : MediaLibraryService() {
     @Inject
     lateinit var navidromeRepository: NavidromeRepository
     @Inject
+    lateinit var listeningStatsTracker: ListeningStatsTracker
+    @Inject
     @AppScope
     lateinit var appScope: CoroutineScope
 
@@ -178,7 +182,10 @@ class MusicService : MediaLibraryService() {
     private var castSessionManagerListener: SessionManagerListener<CastSession>? = null
     private var castRemoteClientCallback: RemoteMediaClient.Callback? = null
     private var observedCastSession: CastSession? = null
+    private var activeCastStatsOccurrenceId: String? = null
+    private var activeCastPlaybackIntent: Boolean = false
     private var playbackSnapshotPersistJob: Job? = null
+    private var playbackSnapshotUnloadWriteJob: Job? = null
     private var isRestoringPlaybackSnapshot = false
     private var isPlaybackUnloadInProgress = false
     private val audioManager by lazy {
@@ -202,6 +209,8 @@ class MusicService : MediaLibraryService() {
         private const val PLAYBACK_SNAPSHOT_DEBOUNCE_MS = 1500L
         private const val FORCED_WIDGET_STATE_DEBOUNCE_MS = 250L
         private const val MEDIA_SESSION_BUTTON_DEBOUNCE_MS = 250L
+        private const val DEFERRED_SERVICE_STARTUP_WORK_DELAY_MS = 1_000L
+        private const val PAUSED_RESTORE_PREPARE_QUEUE_LIMIT = 50
         private val pendingMediaButtonForegroundStarts = AtomicInteger(0)
 
         private const val APP_PACKAGE_PREFIX = "com.theveloper.pixelplay"
@@ -258,29 +267,18 @@ class MusicService : MediaLibraryService() {
 
     private val playerSwapListener: (Player) -> Unit = { newPlayer ->
         serviceScope.launch(Dispatchers.Main) {
-            val oldPlayer = mediaSession?.player
-            oldPlayer?.removeListener(playerListener)
+            publishMediaSessionPlayer(newPlayer, "Swapped MediaSession player to new instance.")
+            prepareReplayGainForTransitionPlayer(newPlayer)
+        }
+    }
 
-            mediaSession?.player = newPlayer
-            newPlayer.addListener(playerListener)
-
-            Timber.tag("MusicService").d("Swapped MediaSession player to new instance.")
-            requestWidgetFullUpdate(force = true)
-            mediaSession?.let { refreshMediaSessionUi(it) }
-
-            // Pre-compute ReplayGain for the incoming track while the crossfade is still running.
-            // isTransitionRunning() is true here, so applyReplayGain stores the result as
-            // pendingReplayGainVolume. onTransitionFinished() applies it cleanly once the fade
-            // loop ends, avoiding any volume jump on the incoming track.
-            //
-            // Also try to set incomingTrackReplayGainVolume immediately from cache so the
-            // fade loop can use the correct final volume even before the IO coroutine finishes.
-            val incomingItem = newPlayer.currentMediaItem
-            val cachedVolume = getCachedReplayGainVolume(incomingItem)
-            if (cachedVolume != null) {
-                engine.incomingTrackReplayGainVolume = cachedVolume
-            }
-            applyReplayGain(incomingItem)
+    private val transitionDisplayPlayerListener: (Player) -> Unit = { displayPlayer ->
+        serviceScope.launch(Dispatchers.Main) {
+            publishMediaSessionPlayer(
+                displayPlayer,
+                "Published incoming crossfade player to MediaSession."
+            )
+            prepareReplayGainForTransitionPlayer(displayPlayer)
         }
     }
 
@@ -289,6 +287,79 @@ class MusicService : MediaLibraryService() {
         // has completed — otherwise onTransitionFinished() may see stale state.
         serviceScope.launch(Dispatchers.Main) {
             onTransitionFinished()
+        }
+    }
+
+    private fun publishMediaSessionPlayer(player: Player, logMessage: String) {
+        val session = mediaSession ?: return
+        val oldPlayer = session.player
+        if (oldPlayer !== player) {
+            oldPlayer.removeListener(playerListener)
+            session.player = player
+            player.addListener(playerListener)
+        }
+
+        Timber.tag("MusicService").d(logMessage)
+        syncLocalListeningStatsFromPlayer(player)
+        requestWidgetFullUpdate(force = true)
+        refreshMediaSessionUi(session)
+    }
+
+    private fun prepareReplayGainForTransitionPlayer(player: Player) {
+        // Pre-compute ReplayGain for the incoming track while the crossfade is still running.
+        // isTransitionRunning() is true here, so applyReplayGain stores the result as
+        // pendingReplayGainVolume. onTransitionFinished() applies it cleanly once the fade
+        // loop ends, avoiding any volume jump on the incoming track.
+        //
+        // Also try to set incomingTrackReplayGainVolume immediately from cache so the
+        // fade loop can use the correct final volume even before the IO coroutine finishes.
+        val incomingItem = player.currentMediaItem
+        val cachedVolume = getCachedReplayGainVolume(incomingItem)
+        if (cachedVolume != null) {
+            engine.incomingTrackReplayGainVolume = cachedVolume
+        }
+        applyReplayGain(incomingItem)
+    }
+
+    private fun syncLocalListeningStatsFromPlayer(
+        player: Player = engine.masterPlayer,
+        forceNewSession: Boolean = false
+    ) {
+        val mediaItem = player.currentMediaItem
+        val songId = mediaItem?.mediaId?.takeIf { it.isNotBlank() }
+        if (songId == null) {
+            if (
+                player.mediaItemCount == 0 ||
+                player.playbackState == Player.STATE_IDLE ||
+                player.playbackState == Player.STATE_ENDED
+            ) {
+                listeningStatsTracker.onPlaybackStopped()
+            }
+            return
+        }
+
+        val positionMs = player.currentPosition.coerceAtLeast(0L)
+        val durationMs = player.duration
+        val fallbackDurationMs = mediaItem.mediaMetadata.extras
+            ?.getLong(MediaItemBuilder.EXTERNAL_EXTRA_DURATION, 0L)
+            ?: 0L
+
+        if (forceNewSession) {
+            listeningStatsTracker.onTrackChanged(
+                songId = songId,
+                positionMs = positionMs,
+                durationMs = durationMs,
+                fallbackDurationMs = fallbackDurationMs,
+                isPlaying = player.isPlaying
+            )
+        } else {
+            listeningStatsTracker.ensureSession(
+                songId = songId,
+                positionMs = positionMs,
+                durationMs = durationMs,
+                fallbackDurationMs = fallbackDurationMs,
+                isPlaying = player.isPlaying
+            )
         }
     }
 
@@ -322,19 +393,27 @@ class MusicService : MediaLibraryService() {
         }
 
         super.onCreate()
+        listeningStatsTracker.initialize(appScope)
         
         // Ensure engine is ready (re-initialize if service was restarted)
         engine.initialize()
         userSelectedVolume = engine.masterPlayer.volume.coerceIn(0f, 1f)
+        syncLocalListeningStatsFromPlayer(engine.masterPlayer)
 
         engine.masterPlayer.addListener(playerListener)
 
         // Handle player swaps (crossfade) to keep MediaSession in sync
         engine.addPlayerSwapListener(playerSwapListener)
+        engine.addTransitionDisplayPlayerListener(transitionDisplayPlayerListener)
         engine.addTransitionFinishedListener(transitionFinishedListener)
 
         controller.initialize()
-        initializeCastWearSync()
+        serviceScope.launch {
+            delay(DEFERRED_SERVICE_STARTUP_WORK_DELAY_MS)
+            if (!isPlaybackUnloadInProgress && mediaSession != null) {
+                initializeCastWearSync()
+            }
+        }
         registerHeadsetReconnectMonitor()
 
         serviceScope.launch {
@@ -807,6 +886,7 @@ class MusicService : MediaLibraryService() {
 
     private fun createSleepTimerPendingIntent(): PendingIntent {
         val intent = Intent(this, SleepTimerReceiver::class.java).apply {
+            action = ACTION_SLEEP_TIMER_EXPIRED
             setPackage(packageName)
         }
         return PendingIntent.getBroadcast(
@@ -928,17 +1008,40 @@ class MusicService : MediaLibraryService() {
             pendingMediaButtonForegroundStart ||
             (isMediaButtonIntent &&
                 !startedTemporaryForegroundInOnCreate &&
-                !isServiceAlreadyForeground())
+                !isServiceAlreadyForeground()) ||
+            when (intent?.action) {
+                PlayerActions.PLAY_PAUSE,
+                PlayerActions.NEXT,
+                PlayerActions.PREVIOUS,
+                PlayerActions.FAVORITE,
+                PlayerActions.PLAY_FROM_QUEUE,
+                PlayerActions.SHUFFLE,
+                PlayerActions.REPEAT -> true
+                else -> false
+            }
         if (needsTemporaryForeground && !startedTemporaryForegroundInOnCreate) {
             startTemporaryForegroundForCommand()
         }
 
         intent?.action?.let { action ->
-            val player = mediaSession?.player ?: return@let
+            Timber.tag(TAG).d("onStartCommand widget action: %s", action)
+            val player = mediaSession?.player ?: engine.masterPlayer
             when (action) {
-                PlayerActions.PLAY_PAUSE -> player.playWhenReady = !player.playWhenReady
-                PlayerActions.NEXT -> player.seekToNext()
-                PlayerActions.PREVIOUS -> player.seekToPrevious()
+                PlayerActions.PLAY_PAUSE -> {
+                    if (player.playbackState == Player.STATE_IDLE) {
+                        player.prepare()
+                    }
+                    player.playWhenReady = !player.playWhenReady
+                    requestWidgetFullUpdate(force = true)
+                }
+                PlayerActions.NEXT -> {
+                    player.seekToNext()
+                    requestWidgetFullUpdate(force = true)
+                }
+                PlayerActions.PREVIOUS -> {
+                    player.seekToPrevious()
+                    requestWidgetFullUpdate(force = true)
+                }
                 PlayerActions.FAVORITE -> {
                     val songId = player.currentMediaItem?.mediaId
                     if (!songId.isNullOrBlank()) {
@@ -964,6 +1067,7 @@ class MusicService : MediaLibraryService() {
                                 timeline.getWindow(i, window)
                                 if (window.mediaItem.mediaId.toLongOrNull() == songId) {
                                     player.seekTo(i, C.TIME_UNSET)
+                                    player.prepare()
                                     player.play()
                                     break
                                 }
@@ -975,6 +1079,10 @@ class MusicService : MediaLibraryService() {
                     val newState = !isManualShuffleEnabled
                     mediaSession?.let { session ->
                         updateManualShuffleState(session, enabled = newState, broadcast = true)
+                    } ?: run {
+                        // Fallback if session not ready
+                        isManualShuffleEnabled = newState
+                        requestWidgetFullUpdate(force = true)
                     }
                 }
                 PlayerActions.REPEAT -> {
@@ -1022,13 +1130,19 @@ class MusicService : MediaLibraryService() {
         return getNavidromeId(mediaItem) != null
     }
 
-    private fun reportNavidromePlayback(state: String) {
+    private fun reportNavidromePlayback(state: String, mediaItem: MediaItem? = engine.masterPlayer.currentMediaItem) {
         val player = engine.masterPlayer
         // Ensure we capture player state on main thread to avoid IllegalStateException
-        val mediaItem = player.currentMediaItem ?: return
-        val navidromeId = getNavidromeId(mediaItem) ?: return
+        val targetItem = mediaItem ?: return
+        val navidromeId = getNavidromeId(targetItem) ?: return
 
-        val positionMs = player.currentPosition
+        // If reporting for current item, use player position.
+        // If reporting "stopped" for a transition, use the item's duration as final position.
+        val positionMs = if (targetItem === player.currentMediaItem) {
+            player.currentPosition
+        } else {
+            targetItem.mediaMetadata.extras?.getLong(MediaItemBuilder.EXTERNAL_EXTRA_DURATION) ?: 0L
+        }
         val playbackRate = player.playbackParameters.speed
 
         // Use appScope for the network call so it survives if serviceScope is cancelled
@@ -1075,8 +1189,9 @@ class MusicService : MediaLibraryService() {
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
-            val player = engine.masterPlayer
+            val player = mediaSession?.player ?: engine.masterPlayer
             Timber.tag(TAG).d("onIsPlayingChanged: $isPlaying. Duration: ${player.duration}, Seekable: ${player.isCurrentMediaItemSeekable}")
+            syncLocalListeningStatsFromPlayer(player)
             
             if (isPlaying) {
                 reportNavidromePlayback("playing")
@@ -1125,7 +1240,8 @@ class MusicService : MediaLibraryService() {
         override fun onPlaybackStateChanged(playbackState: Int) {
             Timber.tag(TAG).d("Playback state changed: $playbackState")
             if (playbackState == Player.STATE_ENDED) {
-                val mediaItem = engine.masterPlayer.currentMediaItem
+                listeningStatsTracker.finalizeCurrentSession()
+                val mediaItem = (mediaSession?.player ?: engine.masterPlayer).currentMediaItem
                 getNavidromeId(mediaItem)?.let { navidromeId ->
                     appScope.launch(Dispatchers.IO) {
                         navidromeRepository.scrobble(navidromeId, submission = true)
@@ -1135,6 +1251,8 @@ class MusicService : MediaLibraryService() {
                 endOfTrackTimerSongId = null
                 reportNavidromePlayback("stopped")
                 stopNavidromePlaybackReporting()
+            } else {
+                syncLocalListeningStatsFromPlayer(mediaSession?.player ?: engine.masterPlayer)
             }
             mediaSession?.let { refreshMediaSessionUi(it) }
             schedulePlaybackSnapshotPersist(immediate = playbackState == Player.STATE_IDLE)
@@ -1160,6 +1278,20 @@ class MusicService : MediaLibraryService() {
                 val state = if (engine.masterPlayer.isPlaying) "playing" else "paused"
                 reportNavidromePlayback(state)
             }
+
+            if (reason == Player.DISCONTINUITY_REASON_AUTO_TRANSITION) {
+                val finishedItem = oldPosition.mediaItem
+                if (isNavidromeMediaItem(finishedItem)) {
+                    val prevId = getNavidromeId(finishedItem)
+                    reportNavidromePlayback("stopped", finishedItem)
+                    if (prevId != null) {
+                        appScope.launch(Dispatchers.IO) {
+                            navidromeRepository.scrobble(prevId, submission = true)
+                        }
+                    }
+                }
+            }
+
             if (reason == Player.DISCONTINUITY_REASON_AUTO_TRANSITION ||
                 reason == Player.DISCONTINUITY_REASON_SEEK
             ) {
@@ -1180,6 +1312,7 @@ class MusicService : MediaLibraryService() {
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            syncLocalListeningStatsFromPlayer(mediaSession?.player ?: engine.masterPlayer, forceNewSession = true)
             if (isNavidromeMediaItem(mediaItem)) {
                 reportNavidromePlayback("starting")
                 if (engine.masterPlayer.isPlaying) {
@@ -1329,10 +1462,7 @@ class MusicService : MediaLibraryService() {
                 // volume instead of hard-coding 1f, preventing the audible jump.
                 pendingReplayGainVolume = volume
                 engine.incomingTrackReplayGainVolume = volume
-                // Apply immediately to masterPlayer so volume is never lost if the
-                // transition is interrupted (e.g. user skips during crossfade).
-                setPlayerVolume(engine.masterPlayer, volume)
-                Timber.tag(TAG).d("ReplayGain: Applied + stored pending volume=%.2f for %s (transition running)",
+                Timber.tag(TAG).d("ReplayGain: Stored pending volume=%.2f for %s (transition running)",
                     volume, mediaItem.mediaMetadata.title
                 )
             } else {
@@ -1394,15 +1524,13 @@ class MusicService : MediaLibraryService() {
         }
 
         if (pending != null) {
-            // pending was already applied to masterPlayer during the transition to ensure
-            // volume is never lost if the transition was interrupted (e.g. user skipped).
-            // Re-applying here is a no-op in volume terms but confirms the final state.
+            // The crossfade loop ramps to this value; apply it now as the stable post-fade volume.
             // Also update lastAppliedReplayGainVolume so any subsequent onPositionDiscontinuity
             // (REASON_AUTO_TRANSITION fires right after crossfade ends) uses this value
             // immediately instead of launching a new IO coroutine and causing a spike.
             lastAppliedReplayGainVolume = pending
             setPlayerVolume(player, pending)
-            Timber.tag(TAG).d("ReplayGain: Transition finished, confirmed pending volume=%.2f", pending)
+            Timber.tag(TAG).d("ReplayGain: Transition finished, applied pending volume=%.2f", pending)
         } else {
             // No pending volume was computed during transition, trigger full computation
             applyReplayGain(mediaSession?.player?.currentMediaItem)
@@ -1421,14 +1549,17 @@ class MusicService : MediaLibraryService() {
 
         val remoteCallback = object : RemoteMediaClient.Callback() {
             override fun onStatusUpdated() {
+                syncCastListeningStatsFromRemote()
                 requestWidgetFullUpdate(force = false)
             }
 
             override fun onMetadataUpdated() {
+                syncCastListeningStatsFromRemote()
                 requestWidgetFullUpdate(force = false)
             }
 
             override fun onQueueStatusUpdated() {
+                syncCastListeningStatsFromRemote()
                 requestWidgetFullUpdate(force = false)
             }
 
@@ -1487,6 +1618,11 @@ class MusicService : MediaLibraryService() {
                 runCatching { remoteClient.registerCallback(callback) }
             }
             remoteClient.requestStatus()
+            syncCastListeningStatsFromRemote()
+        } ?: run {
+            activeCastStatsOccurrenceId = null
+            activeCastPlaybackIntent = false
+            listeningStatsTracker.onPlaybackStopped()
         }
         requestWidgetFullUpdate(force = true)
     }
@@ -1535,6 +1671,7 @@ class MusicService : MediaLibraryService() {
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? = mediaSession
 
     override fun onDestroy() {
+        listeningStatsTracker.finalizeCurrentSession(forceSynchronousPersistence = true)
         reportNavidromePlayback("stopped")
         stopNavidromePlaybackReporting()
         playbackSnapshotPersistJob?.cancel()
@@ -1548,7 +1685,9 @@ class MusicService : MediaLibraryService() {
         replayGainJob?.cancel()
 
         engine.removePlayerSwapListener(playerSwapListener)
+        engine.removeTransitionDisplayPlayerListener(transitionDisplayPlayerListener)
         engine.removeTransitionFinishedListener(transitionFinishedListener)
+        mediaSession?.player?.removeListener(playerListener)
         engine.masterPlayer.removeListener(playerListener)
 
         mediaSession?.run {
@@ -1561,6 +1700,26 @@ class MusicService : MediaLibraryService() {
         Thread.currentThread().setUncaughtExceptionHandler(previousMainThreadExceptionHandler)
         previousMainThreadExceptionHandler = null
         super.onDestroy()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        // Release in-process bitmap caches when the system signals memory pressure.
+        // MusicService holds up to ~220 KB in cachedWidgetArtBytes and another copy
+        // inside lastWidgetPlayerInfo.albumArtBitmapData. Under moderate-to-critical
+        // pressure these are safe to drop — the next widget update cycle will reload them.
+        //
+        // Raw int value used instead of deprecated ComponentCallbacks2 constant:
+        //   TRIM_MEMORY_RUNNING_LOW = 10
+        // This single threshold covers all higher-severity levels too
+        // (TRIM_MEMORY_BACKGROUND = 40, TRIM_MEMORY_COMPLETE = 80, etc.).
+        if (level >= 10 /* TRIM_MEMORY_RUNNING_LOW */) {
+            Timber.tag(TAG).d("onTrimMemory(level=%d): releasing widget bitmap caches", level)
+            invalidateCachedWidgetArtwork()
+            // Drop the stale PlayerInfo copy so its embedded ByteArray is GC-eligible.
+            // The next processWidgetUpdateInternal() call will rebuild it from scratch.
+            lastWidgetPlayerInfo = null
+        }
     }
 
     private fun registerHeadsetReconnectMonitor() {
@@ -1795,9 +1954,9 @@ class MusicService : MediaLibraryService() {
                     resolvedIndex,
                     snapshot.currentPositionMs.coerceAtLeast(0L)
                 )
-                // Even paused restores must prepare the timeline so duration/seek state is
-                // available immediately when the UI opens after a cold start.
-                player.prepare()
+                if (shouldRestorePlaying || preparedItems.size <= PAUSED_RESTORE_PREPARE_QUEUE_LIMIT) {
+                    player.prepare()
+                }
                 player.repeatMode = safeRepeatMode
                 player.shuffleModeEnabled = false
                 isManualShuffleEnabled = snapshot.shuffleEnabled
@@ -1906,16 +2065,46 @@ class MusicService : MediaLibraryService() {
     }
 
     private data class RemotePlaybackSnapshot(
+        val occurrenceId: String,
         val songId: String?,
         val title: String,
         val artist: String,
         val artworkUri: Uri?,
         val isPlaying: Boolean,
+        val isActuallyPlaying: Boolean,
         val currentPositionMs: Long,
         val totalDurationMs: Long,
         val repeatMode: Int,
         val isShuffleEnabled: Boolean,
     )
+
+    private fun syncCastListeningStatsFromRemote() {
+        val snapshot = resolveCastRemoteSnapshot() ?: return
+        val songId = snapshot.songId?.takeIf { it.isNotBlank() }
+        if (songId == null) {
+            activeCastStatsOccurrenceId = null
+            listeningStatsTracker.onPlaybackStopped()
+            return
+        }
+
+        if (activeCastStatsOccurrenceId != snapshot.occurrenceId) {
+            activeCastStatsOccurrenceId = snapshot.occurrenceId
+            listeningStatsTracker.onTrackChanged(
+                songId = songId,
+                positionMs = snapshot.currentPositionMs,
+                durationMs = snapshot.totalDurationMs,
+                isPlaying = snapshot.isActuallyPlaying
+            )
+            return
+        }
+
+        listeningStatsTracker.ensureSession(
+            songId = songId,
+            positionMs = snapshot.currentPositionMs,
+            durationMs = snapshot.totalDurationMs,
+            isPlaying = snapshot.isActuallyPlaying
+        )
+    }
 
     private fun resolveCastRemoteSnapshot(): RemotePlaybackSnapshot? {
         val remoteClient = observedCastSession?.remoteMediaClient
@@ -1938,6 +2127,13 @@ class MusicService : MediaLibraryService() {
             ?.customData
             ?.optString("songId")
             ?.takeIf { it.isNotBlank() }
+        val occurrenceId = currentItem
+            ?.itemId
+            ?.takeIf { it > 0 }
+            ?.toString()
+            ?: songId
+            ?: mediaInfo?.contentId
+            ?: return null
 
         val durationHintMs = currentItem
             ?.customData
@@ -1959,13 +2155,20 @@ class MusicService : MediaLibraryService() {
             MediaStatus.REPEAT_MODE_REPEAT_ALL_AND_SHUFFLE -> Player.REPEAT_MODE_ALL
             else -> Player.REPEAT_MODE_OFF
         }
+        val remotePlayback = CastRemotePlaybackState.project(
+            mediaStatus = mediaStatus,
+            previousPlayIntent = activeCastPlaybackIntent
+        )
+        activeCastPlaybackIntent = remotePlayback.playWhenReady
 
         return RemotePlaybackSnapshot(
+            occurrenceId = occurrenceId,
             songId = songId,
             title = metadata?.getString(CastMediaMetadata.KEY_TITLE).orEmpty(),
             artist = metadata?.getString(CastMediaMetadata.KEY_ARTIST).orEmpty(),
             artworkUri = imageUri,
-            isPlaying = mediaStatus.playerState == MediaStatus.PLAYER_STATE_PLAYING,
+            isPlaying = remotePlayback.isPlaying,
+            isActuallyPlaying = mediaStatus.playerState == MediaStatus.PLAYER_STATE_PLAYING,
             currentPositionMs = remoteClient.approximateStreamPosition.coerceAtLeast(0L),
             totalDurationMs = effectiveDurationMs,
             repeatMode = mappedRepeatMode,
@@ -2656,6 +2859,15 @@ class MusicService : MediaLibraryService() {
                     "startForegroundService not allowed; ignoring redundant self-start request"
                 )
                 serviceIntent?.component ?: ComponentName(this, javaClass)
+            } catch (e: BackgroundServiceStartNotAllowedException) {
+                // Thrown when startForegroundService() itself is called while the app is in a
+                // background-cached state (distinct from ForegroundServiceStartNotAllowedException).
+                // Safe to swallow: the service is either already running or Media3 will retry.
+                Timber.tag(TAG).w(
+                    e,
+                    "startForegroundService blocked (app in background); ignoring self-start request"
+                )
+                serviceIntent?.component ?: ComponentName(this, javaClass)
             }
         }
         return super.startForegroundService(serviceIntent)
@@ -2723,10 +2935,12 @@ class MusicService : MediaLibraryService() {
         endOfTrackTimerSongId = null
 
         if (preservePlaybackSnapshot) {
-            persistPlaybackSnapshotBlocking()
+            persistPlaybackSnapshotOnUnload()
         } else {
-            clearPlaybackSnapshotBlocking()
+            clearPlaybackSnapshotOnUnload()
         }
+
+        listeningStatsTracker.finalizeCurrentSession(forceSynchronousPersistence = true)
 
         player.playWhenReady = false
         player.stop()
@@ -2738,22 +2952,23 @@ class MusicService : MediaLibraryService() {
         stopSelf()
     }
 
-    private fun persistPlaybackSnapshotBlocking() {
+    private fun persistPlaybackSnapshotOnUnload() {
         val snapshot = capturePlaybackSnapshotFromPlayer(playWhenReadyOverride = false)
-        writePlaybackSnapshotBlocking(snapshot)
+        writePlaybackSnapshotOnUnload(snapshot)
     }
 
-    private fun clearPlaybackSnapshotBlocking() {
-        writePlaybackSnapshotBlocking(null)
+    private fun clearPlaybackSnapshotOnUnload() {
+        writePlaybackSnapshotOnUnload(null)
     }
 
-    private fun writePlaybackSnapshotBlocking(snapshot: PlaybackQueueSnapshot?) {
-        runCatching {
-            runBlocking(Dispatchers.IO) {
+    private fun writePlaybackSnapshotOnUnload(snapshot: PlaybackQueueSnapshot?) {
+        playbackSnapshotUnloadWriteJob?.cancel()
+        playbackSnapshotUnloadWriteJob = appScope.launch {
+            runCatching {
                 userPreferencesRepository.setPlaybackQueueSnapshot(snapshot)
+            }.onFailure { e ->
+                Timber.tag(TAG).w(e, "Failed to persist playback snapshot during unload")
             }
-        }.onFailure { e ->
-            Timber.tag(TAG).w(e, "Failed to persist playback snapshot during unload")
         }
     }
 

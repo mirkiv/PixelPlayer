@@ -295,6 +295,10 @@ class MusicRepositoryImpl @Inject constructor(
         return musicDao.getSongCount().distinctUntilChanged()
     }
 
+    override fun getCloudSongCountFlow(): Flow<Int> {
+        return musicDao.getCloudSongCount().distinctUntilChanged()
+    }
+
     override suspend fun getRandomSongs(limit: Int): List<Song> = withContext(Dispatchers.IO) {
         val filter = cachedDirFilter.value
         musicDao.getRandomSongs(limit, filter.allowedParentDirs, filter.applyFilter).map { it.toSong() }
@@ -474,6 +478,10 @@ class MusicRepositoryImpl @Inject constructor(
 
     override fun getArtistById(artistId: Long): Flow<Artist?> {
         return musicDao.getArtistById(artistId).map { it?.toArtist() }
+    }
+
+    override suspend fun getArtistIdByName(name: String): Long? = withContext(Dispatchers.IO) {
+        musicDao.getArtistIdByName(name)
     }
 
     override fun getArtistsForSong(songId: Long): Flow<List<Artist>> {
@@ -987,6 +995,7 @@ class MusicRepositoryImpl @Inject constructor(
         val allChannels = telegramDao.getAllChannels().first()
         allChannels.forEach { channel ->
             telegramRepository.deleteAppPlaylistForTelegramChannel(channel.chatId)
+            telegramRepository.deleteAllTopicPlaylistsForChannel(channel.chatId)
         }
 
         musicDao.clearAllTelegramSongs()

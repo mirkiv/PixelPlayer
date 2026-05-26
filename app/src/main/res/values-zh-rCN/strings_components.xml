@@ -23,6 +23,7 @@
     <string name="lyrics_more_show_romanization">显示罗马音</string>
     <string name="lyrics_more_show_translations">显示翻译</string>
     <string name="lyrics_more_disable_immersive_once">关闭沉浸模式（仅本次）</string>
+    <string name="lyrics_more_keep_screen_on">保持屏幕开启</string>
     <string name="cd_lyrics_align_left">歌词左对齐</string>
     <string name="cd_lyrics_align_center">歌词居中对齐</string>
     <string name="cd_lyrics_align_right">歌词右对齐</string>
@@ -45,12 +46,14 @@
     <!-- AI metadata sheet -->
     <string name="ai_metadata_headline_success">标签已完美整理！</string>
     <string name="ai_metadata_headline_default">AI 元数据</string>
-    <string name="ai_metadata_subtitle_generating">正在参考每日合辑指南…</string>
+    <string name="ai_metadata_subtitle_generating">正在参考每日合辑指南……</string>
     <string name="ai_metadata_subtitle_review">检查并完善生成的详细信息</string>
     <string name="song_field_title">标题</string>
     <string name="song_field_artist">艺术家</string>
     <string name="song_field_album">专辑</string>
+    <string name="song_field_album_artist">专辑艺术家</string>
     <string name="song_field_genre">流派</string>
+    <string name="song_field_composer">作曲</string>
     <string name="action_try_again">重试</string>
     <string name="action_apply_changes">应用更改</string>
 
@@ -102,6 +105,32 @@
     <string name="song_info_watch_unavailable">手表不可用</string>
     <string name="cd_send_song_to_watch">将歌曲发送到手表</string>
     <string name="cd_watch_unavailable">手表不可用</string>
+    <string name="song_info_set_as_short">设为</string>
+    <string name="song_info_choose_tone">设为声音</string>
+    <string name="cd_choose_song_tone">选择如何将这首歌用作系统声音</string>
+    <string name="song_info_set_ringtone">设为铃声</string>
+    <string name="cd_set_song_as_ringtone">将歌曲设为铃声</string>
+    <string name="song_info_tone_picker_title">将这首歌用作</string>
+    <string name="song_info_tone_picker_body">选择 PixelPlayer 要安装此声音的位置。</string>
+    <string name="song_info_tone_ringtone_title">手机铃声</string>
+    <string name="song_info_tone_ringtone_subtitle">来电</string>
+    <string name="song_info_tone_notification_title">通知声音</string>
+    <string name="song_info_tone_notification_subtitle">消息和应用提醒</string>
+    <string name="song_info_tone_alarm_title">闹钟声音</string>
+    <string name="song_info_tone_alarm_subtitle">时钟闹钟</string>
+    <string name="song_info_tone_confirm_title">确认声音更改</string>
+    <string name="song_info_tone_confirm_body">将「%1$s」设为%2$s？</string>
+    <string name="song_info_tone_confirm_action">设置声音</string>
+    <string name="song_info_tone_success">已将「%1$s」设为%2$s</string>
+    <string name="song_info_tone_ringtone_label">铃声</string>
+    <string name="song_info_tone_notification_label">通知声音</string>
+    <string name="song_info_tone_alarm_label">闹钟声音</string>
+    <string name="song_info_ringtone_permission_prompt">开启修改系统设置，然后返回 PixelPlayer 自动完成。</string>
+    <string name="song_info_ringtone_permission_missing">未开启修改系统设置。</string>
+    <string name="song_info_ringtone_success">已将「%1$s」设为铃声</string>
+    <string name="song_info_ringtone_local_only">只有本地歌曲可用作系统声音。</string>
+    <string name="song_info_ringtone_missing_file">无法准备此音频文件。</string>
+    <string name="song_info_ringtone_failed">无法更改声音：%1$s</string>
     <string name="song_info_label_duration">时长</string>
     <string name="song_info_label_song_metadata">歌曲信息</string>
     <string name="cd_duration_icon">时长</string>
@@ -139,9 +168,9 @@
     <string name="create_playlist_name_label">播放列表名称</string>
     <string name="create_playlist_name_placeholder">我的播放列表</string>
     <string name="action_create">创建</string>
-    <string name="playlist_picker_add_songs_title">将 %1$d 首歌曲添加到…</string>
+    <string name="playlist_picker_add_songs_title">将 %1$d 首歌曲添加到……</string>
     <string name="playlist_picker_select_playlists">选择播放列表</string>
-    <string name="search_playlists_hint">搜索播放列表…</string>
+    <string name="search_playlists_hint">搜索播放列表……</string>
 
     <string name="multi_selection_playlists_count_upper">%1$d 个播放列表</string>
     <string name="cd_export_all">全部导出</string>
@@ -153,7 +182,7 @@
     <string name="reorder_tabs_sheet_title">重新排序媒体库标签</string>
     <string name="reorder_tabs_reset_dialog_title">重置顺序</string>
     <string name="reorder_tabs_reset_dialog_body">要将标签顺序重置为默认值吗？</string>
-    <string name="reorder_tabs_reordering">正在重新排序标签…</string>
+    <string name="reorder_tabs_reordering">正在重新排序标签……</string>
     <string name="cd_drag_handle">拖动把手</string>
     <string name="cd_reset">重置</string>
     <string name="action_done">完成</string>
